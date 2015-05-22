@@ -293,6 +293,137 @@ eth::OnOpFunc FakeExtVM::simpleTrace()
 
 namespace dev { namespace test {
 
+void doVMTest(json_spirit::mObject& o, bool _fillin)
+{
+			BOOST_REQUIRE(o.count("env") > 0);
+			BOOST_REQUIRE(o.count("pre") > 0);
+			BOOST_REQUIRE(o.count("exec") > 0);
+
+			FakeExtVM fev;
+			fev.importEnv(o["env"].get_obj());
+			fev.importState(o["pre"].get_obj());
+
+			if (_fillin)
+				o["pre"] = mValue(fev.exportState());
+
+			fev.importExec(o["exec"].get_obj());
+			if (fev.code.empty())
+			{
+				fev.thisTxCode = get<3>(fev.addresses.at(fev.myAddress));
+				fev.code = fev.thisTxCode;
+			}
+
+			bytes output;
+			u256 gas;
+			bool vmExceptionOccured = false;
+			try
+			{
+				auto vm = eth::VMFactory::create(fev.gas);
+				auto vmtrace = Options::get().vmtrace ? fev.simpleTrace() : OnOpFunc{};
+				auto outputRef = bytesConstRef{};
+				{
+					// FIXME:
+					//Listener::ExecTimeGuard guard{i.first};
+					outputRef = vm->go(fev, vmtrace);
+				}
+				output = outputRef.toBytes();
+				gas = vm->gas();
+			}
+			catch (VMException const&)
+			{
+				std::cout << "    Safe VM Exception\n";
+				vmExceptionOccured = true;
+			}
+			catch (Exception const& _e)
+			{
+				cnote << "VM did throw an exception: " << diagnostic_information(_e);
+				BOOST_ERROR("Failed VM Test with Exception: " << _e.what());
+			}
+			catch (std::exception const& _e)
+			{
+				cnote << "VM did throw an exception: " << _e.what();
+				BOOST_ERROR("Failed VM Test with Exception: " << _e.what());
+			}
+
+			// delete null entries in storage for the sake of comparison
+
+			for (auto  &a: fev.addresses)
+			{
+				vector<u256> keystoDelete;
+				for (auto &s: get<2>(a.second))
+				{
+					if (s.second == 0)
+						keystoDelete.push_back(s.first);
+				}
+				for (auto const key: keystoDelete )
+				{
+					get<2>(a.second).erase(key);
+				}
+			}
+
+			if (_fillin)
+			{
+				o["env"] = mValue(fev.exportEnv());
+				o["exec"] = mValue(fev.exportExec());
+				if (!vmExceptionOccured)
+				{
+					o["post"] = mValue(fev.exportState());
+
+					if (o.count("expect") > 0)
+					{
+						State postState(OverlayDB(), eth::BaseState::Empty);
+						State expectState(OverlayDB(), eth::BaseState::Empty);
+						stateOptionsMap expectStateMap;
+						ImportTest::importState(o["post"].get_obj(), postState);
+						ImportTest::importState(o["expect"].get_obj(), expectState, expectStateMap);
+						ImportTest::checkExpectedState(expectState, postState, expectStateMap, Options::get().checkState ? WhenError::Throw : WhenError::DontThrow);
+						o.erase(o.find("expect"));
+					}
+
+					o["callcreates"] = fev.exportCallCreates();
+					o["out"] = output.size() > 4096 ? "#" + toString(output.size()) : toHex(output, 2, HexPrefix::Add);
+					o["gas"] = toCompactHex(gas, HexPrefix::Add, 1);
+					o["logs"] = exportLog(fev.sub.logs);
+				}
+			}
+			else
+			{
+				if (o.count("post") > 0)	// No exceptions expected
+				{
+					BOOST_CHECK(!vmExceptionOccured);
+
+					BOOST_REQUIRE(o.count("post") > 0);
+					BOOST_REQUIRE(o.count("callcreates") > 0);
+					BOOST_REQUIRE(o.count("out") > 0);
+					BOOST_REQUIRE(o.count("gas") > 0);
+					BOOST_REQUIRE(o.count("logs") > 0);
+
+					dev::test::FakeExtVM test;
+					test.importState(o["post"].get_obj());
+					test.importCallCreates(o["callcreates"].get_array());
+					test.sub.logs = importLog(o["logs"].get_array());
+
+					checkOutput(output, o);
+
+					BOOST_CHECK_EQUAL(toInt(o["gas"]), gas);
+
+					State postState, expectState;
+					mObject mPostState = fev.exportState();
+					ImportTest::importState(mPostState, postState);
+					ImportTest::importState(o["post"].get_obj(), expectState);
+					ImportTest::checkExpectedState(expectState, postState);
+
+					checkAddresses<std::map<Address, std::tuple<u256, u256, std::map<u256, u256>, bytes> > >(test.addresses, fev.addresses);
+
+					checkCallCreates(fev.callcreates, test.callcreates);
+
+					checkLog(fev.sub.logs, test.sub.logs);
+				}
+				else	// Exception expected
+					BOOST_CHECK(vmExceptionOccured);
+			}
+}
+
 void doVMTests(json_spirit::mValue& v, bool _fillin)
 {
 	for (auto& i: v.get_obj())
@@ -303,134 +434,8 @@ void doVMTests(json_spirit::mValue& v, bool _fillin)
 			o.clear();
 			continue;
 		}
-
 		std::cout << "  " << i.first << "\n";
-		BOOST_REQUIRE(o.count("env") > 0);
-		BOOST_REQUIRE(o.count("pre") > 0);
-		BOOST_REQUIRE(o.count("exec") > 0);
-
-		FakeExtVM fev;
-		fev.importEnv(o["env"].get_obj());
-		fev.importState(o["pre"].get_obj());
-
-		if (_fillin)
-			o["pre"] = mValue(fev.exportState());
-
-		fev.importExec(o["exec"].get_obj());
-		if (fev.code.empty())
-		{
-			fev.thisTxCode = get<3>(fev.addresses.at(fev.myAddress));
-			fev.code = fev.thisTxCode;
-		}
-
-		bytes output;
-		u256 gas;
-		bool vmExceptionOccured = false;
-		try
-		{
-			auto vm = eth::VMFactory::create(fev.gas);
-			auto vmtrace = Options::get().vmtrace ? fev.simpleTrace() : OnOpFunc{};
-			auto outputRef = bytesConstRef{};
-			{
-				Listener::ExecTimeGuard guard{i.first};
-				outputRef = vm->go(fev, vmtrace);
-			}
-			output = outputRef.toBytes();
-			gas = vm->gas();
-		}
-		catch (VMException const&)
-		{
-			std::cout << "    Safe VM Exception\n";
-			vmExceptionOccured = true;
-		}
-		catch (Exception const& _e)
-		{
-			cnote << "VM did throw an exception: " << diagnostic_information(_e);
-			BOOST_ERROR("Failed VM Test with Exception: " << _e.what());
-		}
-		catch (std::exception const& _e)
-		{
-			cnote << "VM did throw an exception: " << _e.what();
-			BOOST_ERROR("Failed VM Test with Exception: " << _e.what());
-		}
-
-		// delete null entries in storage for the sake of comparison
-
-		for (auto  &a: fev.addresses)
-		{
-			vector<u256> keystoDelete;
-			for (auto &s: get<2>(a.second))
-			{
-				if (s.second == 0)
-					keystoDelete.push_back(s.first);
-			}
-			for (auto const key: keystoDelete )
-			{
-				get<2>(a.second).erase(key);
-			}
-		}
-
-		if (_fillin)
-		{
-			o["env"] = mValue(fev.exportEnv());
-			o["exec"] = mValue(fev.exportExec());
-			if (!vmExceptionOccured)
-			{
-				o["post"] = mValue(fev.exportState());
-
-				if (o.count("expect") > 0)
-				{
-					State postState(OverlayDB(), eth::BaseState::Empty);
-					State expectState(OverlayDB(), eth::BaseState::Empty);
-					stateOptionsMap expectStateMap;
-					ImportTest::importState(o["post"].get_obj(), postState);
-					ImportTest::importState(o["expect"].get_obj(), expectState, expectStateMap);
-					ImportTest::checkExpectedState(expectState, postState, expectStateMap, Options::get().checkState ? WhenError::Throw : WhenError::DontThrow);
-					o.erase(o.find("expect"));
-				}
-
-				o["callcreates"] = fev.exportCallCreates();
-				o["out"] = output.size() > 4096 ? "#" + toString(output.size()) : toHex(output, 2, HexPrefix::Add);
-				o["gas"] = toCompactHex(gas, HexPrefix::Add, 1);
-				o["logs"] = exportLog(fev.sub.logs);
-			}
-		}
-		else
-		{
-			if (o.count("post") > 0)	// No exceptions expected
-			{
-				BOOST_CHECK(!vmExceptionOccured);
-
-				BOOST_REQUIRE(o.count("post") > 0);
-				BOOST_REQUIRE(o.count("callcreates") > 0);
-				BOOST_REQUIRE(o.count("out") > 0);
-				BOOST_REQUIRE(o.count("gas") > 0);
-				BOOST_REQUIRE(o.count("logs") > 0);
-
-				dev::test::FakeExtVM test;
-				test.importState(o["post"].get_obj());
-				test.importCallCreates(o["callcreates"].get_array());
-				test.sub.logs = importLog(o["logs"].get_array());
-
-				checkOutput(output, o);
-
-				BOOST_CHECK_EQUAL(toInt(o["gas"]), gas);
-
-				State postState, expectState;
-				mObject mPostState = fev.exportState();
-				ImportTest::importState(mPostState, postState);
-				ImportTest::importState(o["post"].get_obj(), expectState);
-				ImportTest::checkExpectedState(expectState, postState);
-
-				checkAddresses<std::map<Address, std::tuple<u256, u256, std::map<u256, u256>, bytes> > >(test.addresses, fev.addresses);
-
-				checkCallCreates(fev.callcreates, test.callcreates);
-
-				checkLog(fev.sub.logs, test.sub.logs);
-			}
-			else	// Exception expected
-				BOOST_CHECK(vmExceptionOccured);
-		}
+		doVMTest(o, _fillin);
 	}
 }
 
